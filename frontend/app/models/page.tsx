@@ -11,91 +11,72 @@ export default function Models() {
   ]
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
-      <nav className="bg-gray-800 p-4">
-        <div className="container mx-auto flex justify-between items-center">
-          <h1 className="text-2xl font-bold">Checkmark</h1>
-          <div className="space-x-4">
-            <Link href="/dashboard" className="text-gray-300 hover:text-white">Dashboard</Link>
-            <Link href="/matches" className="text-gray-300 hover:text-white">Matches</Link>
-            <Link href="/models" className="text-blue-400 hover:text-white">Models</Link>
-          </div>
-        </div>
-      </nav>
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      {/* Header */}
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold text-white mb-2">AI Models</h1>
+        <p className="text-zinc-400">Registered AI chess models and their performance metrics</p>
+      </div>
 
-      <div className="container mx-auto px-4 py-8">
-        <h2 className="text-3xl font-bold mb-6">AI Models</h2>
+      {/* Models Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {models.map((model) => {
+          const winRate = ((model.wins / model.games) * 100).toFixed(1)
+          const lossRate = ((model.losses / model.games) * 100).toFixed(1)
+          const drawRate = ((model.draws / model.games) * 100).toFixed(1)
 
-        <div className="grid gap-6">
-          {models.map((model) => (
-            <div key={model.id} className="bg-gray-800 rounded-lg p-6">
-              <div className="flex justify-between items-start">
+          return (
+            <Link
+              key={model.id}
+              href={`/models/${model.id}`}
+              className="card card-hover block"
+            >
+              <div className="flex justify-between items-start mb-4">
                 <div>
-                  <h3 className="text-2xl font-bold">{model.name}</h3>
-                  <p className="text-gray-400">Provider: {model.provider}</p>
+                  <h3 className="text-xl font-bold text-white mb-1">{model.name}</h3>
+                  <p className="text-sm text-zinc-400">{model.provider}</p>
                 </div>
                 <div className="text-right">
-                  <div className="text-3xl font-bold text-green-400">Elo: {model.elo}</div>
-                  <div className="text-sm text-gray-400">Games: {model.games}</div>
+                  <div className="text-2xl font-bold text-blue-400">{model.elo}</div>
+                  <div className="text-xs text-zinc-500">ELO</div>
                 </div>
               </div>
 
-              <div className="mt-4 grid grid-cols-3 gap-4">
-                <div className="bg-gray-700 rounded p-3 text-center">
-                  <div className="text-2xl font-bold text-green-400">{model.wins}</div>
-                  <div className="text-sm text-gray-400">Wins</div>
+              {/* Stats Grid */}
+              <div className="grid grid-cols-3 gap-3 mb-4">
+                <div className="bg-zinc-800/50 rounded-lg p-3 text-center">
+                  <div className="text-xl font-bold text-green-400">{model.wins}</div>
+                  <div className="text-xs text-zinc-500">Wins</div>
                 </div>
-                <div className="bg-gray-700 rounded p-3 text-center">
-                  <div className="text-2xl font-bold text-red-400">{model.losses}</div>
-                  <div className="text-sm text-gray-400">Losses</div>
+                <div className="bg-zinc-800/50 rounded-lg p-3 text-center">
+                  <div className="text-xl font-bold text-red-400">{model.losses}</div>
+                  <div className="text-xs text-zinc-500">Losses</div>
                 </div>
-                <div className="bg-gray-700 rounded p-3 text-center">
-                  <div className="text-2xl font-bold text-yellow-400">{model.draws}</div>
-                  <div className="text-sm text-gray-400">Draws</div>
+                <div className="bg-zinc-800/50 rounded-lg p-3 text-center">
+                  <div className="text-xl font-bold text-yellow-400">{model.draws}</div>
+                  <div className="text-xs text-zinc-500">Draws</div>
                 </div>
               </div>
 
-              <div className="mt-4 bg-gray-700 rounded p-3">
+              {/* Win Rate Bar */}
+              <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span>Win Rate:</span>
-                  <span className="font-bold">{((model.wins / model.games) * 100).toFixed(1)}%</span>
+                  <span className="text-zinc-400">Win Rate</span>
+                  <span className="text-green-400 font-medium">{winRate}%</span>
                 </div>
-                <div className="flex justify-between text-sm mt-1">
-                  <span>Loss Rate:</span>
-                  <span className="font-bold">{((model.losses / model.games) * 100).toFixed(1)}%</span>
+                <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-green-500 rounded-full"
+                    style={{ width: `${winRate}%` }}
+                  />
                 </div>
-                <div className="flex justify-between text-sm mt-1">
-                  <span>Draw Rate:</span>
-                  <span className="font-bold">{((model.draws / model.games) * 100).toFixed(1)}%</span>
+                <div className="flex justify-between text-xs text-zinc-500 pt-1">
+                  <span>{model.games} games total</span>
                 </div>
               </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="mt-8 bg-gray-800 rounded-lg p-6">
-          <h3 className="text-xl font-bold mb-4">Add New Model</h3>
-          <div className="grid grid-cols-2 gap-4">
-            <input
-              type="text"
-              placeholder="Model Name"
-              className="bg-gray-700 rounded px-4 py-2 text-white"
-            />
-            <input
-              type="text"
-              placeholder="Provider (e.g., openrouter/anthropic)"
-              className="bg-gray-700 rounded px-4 py-2 text-white"
-            />
-            <input
-              type="number"
-              placeholder="Expected Elo"
-              className="bg-gray-700 rounded px-4 py-2 text-white"
-            />
-            <button className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded">
-              Add Model
-            </button>
-          </div>
-        </div>
+            </Link>
+          )
+        })}
       </div>
     </div>
   )

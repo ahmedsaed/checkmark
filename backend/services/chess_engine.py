@@ -3,7 +3,7 @@ Chess Engine Service for Checkmark Platform
 Implements core chess logic using python-chess library
 """
 
-from chess import Board, Square, Move, COLOR_WHITE, COLOR_BLACK
+from chess import Board, Square, Move, WHITE, BLACK
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 import uuid
@@ -205,9 +205,16 @@ class ChessEngine:
             board: Current board state
             
         Returns:
-            List of legal moves in SAN notation
+            List of legal moves in SAN notation (e.g., ['e4', 'Nf3', 'd5'])
         """
-        return [str(move) for move in board.legal_moves]
+        san_moves: List[str] = []
+        for move in board.legal_moves:
+            try:
+                san_moves.append(board.san(move))
+            except ValueError:
+                # Fallback for ambiguous moves
+                san_moves.append(move.uci())
+        return san_moves
 
     def get_piece_at(self, board: Board, square: Square) -> Optional[str]:
         """
@@ -251,6 +258,19 @@ class ChessEngine:
         """
         move = board.parse_uci(uci)
         return str(move) if move else uci
+
+    def square_to_str(self, square: Square) -> str:
+        """
+        Convert a chess Square to its string representation (e.g., 'e4').
+        
+        Args:
+            square: A chess Square object
+            
+        Returns:
+            String representation of the square
+        """
+        from chess import square_name
+        return square_name(square)
 
 
 # Global board instance for convenience

@@ -1,14 +1,17 @@
 """
-MongoDB connection utilities for Checkmark Platform
+MongoDB connection utilities for Checkmark Platform.
+
+Provides a singleton MongoDBConfig that manages the async Motor client
+lifecycle (connect on first use, close on shutdown).
 """
 
-from typing import Optional
-from motor.motor_asyncio import AsyncIOMotorClient
+from typing import Optional, Any
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 import os
 
 
 class MongoDBConfig:
-    """MongoDB connection configuration"""
+    """Singleton MongoDB connection manager."""
 
     def __init__(self):
         self.connection_string = os.getenv(
@@ -16,66 +19,64 @@ class MongoDBConfig:
             "mongodb://localhost:27017"
         )
         self.database_name = os.getenv("MONGODB_DATABASE", "checkmark")
-        self.client: Optional[AsyncIOMotorClient] = None
-        self.db: Optional[Any] = None
+        self._client: Optional[AsyncIOMotorClient] = None
+        self._db: Optional[AsyncIOMotorDatabase] = None
 
     async def connect(self) -> AsyncIOMotorClient:
-        """Establish connection to MongoDB"""
-        if self.client is None:
-            self.client = AsyncIOMotorClient(self.connection_string)
-            self.db = self.client[self.database_name]
-            
-            # Set connection timeout
-            self.client.server_info_timeout = 5
-            
-            # Handle connection events
-            self.client.start_session()
-            
-        return self.client
+        """Establish connection to MongoDB (idempotent)."""
+        if self._client is None:
+            self._client = AsyncIOMotorClient(
+                self.connection_string,
+                serverSelectionTimeoutMS=5000,
+            )
+            self._db = self._client[self.database_name]
+            # Verify connectivity
+            await self._client.admin.command("ping")
+        return self._client
 
-    async def disconnect(self):
-        """Close MongoDB connection"""
-        if self.client:
-            self.client.close()
-            self.client = None
-            self.db = None
+    async def disconnect(self) -> None:
+        """Close MongoDB connection."""
+        if self._client:
+            self._client.close()
+            self._client = None
+            self._db = None
 
     @property
-    def database(self):
-        """Get database reference"""
-        if self.db is None:
-            raise ConnectionError("Not connected to MongoDB")
-        return self.db
+    def database(self) -> AsyncIOMotorDatabase:
+        """Get database reference."""
+        if self._db is None:
+            raise ConnectionError("Not connected to MongoDB — call connect() first")
+        return self._db
 
-    @property
-    def collection(self, name: str):
-        """Get collection reference"""
-        if self.db is None:
-            raise ConnectionError("Not connected to MongoDB")
-        return self.db[name]
+    def get_collection(self, name: str) -> Any:
+        """Get a collection reference by name."""
+        return self.database[name]
 
 
-# Singleton instance
-_mongo_config = None
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+_mongo_config: Optional[MongoDBConfig] = None
 
 
 def get_mongo_config() -> MongoDBConfig:
-    """Get the singleton MongoDBConfig instance"""
+    """Return the singleton MongoDBConfig instance."""
     global _mongo_config
     if _mongo_config is None:
         _mongo_config = MongoDBConfig()
     return _mongo_config
 
 
-async def get_database() -> Any:
-    """Get MongoDB database instance"""
+async def get_database() -> AsyncIOMotorDatabase:
+    """Convenience: connect and return the database."""
     config = get_mongo_config()
     await config.connect()
     return config.database
 
 
 async def close_database() -> None:
-    """Close MongoDB database connection"""
+    """Convenience: close the database connection."""
     config = get_mongo_config()
-    if config.client:
-        config.disconnect()
+    if config._client:
+        await config.disconnect()

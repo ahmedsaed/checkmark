@@ -1,19 +1,25 @@
 """
-Pydantic schemas for Checkmark Chess Benchmarking Platform
+Pydantic schemas for Checkmark Chess Benchmarking Platform.
+
+These are the API request/response schemas used by FastAPI endpoints.
+MongoDB document models live in models.py.
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from datetime import datetime
 
 
-# Match Schemas
+# ---------------------------------------------------------------------------
+# Match schemas
+# ---------------------------------------------------------------------------
+
 class MatchCreate(BaseModel):
-    model_a_id: str = Field(..., description="ID of first model")
-    model_b_id: str = Field(..., description="ID of second model")
+    model_a_id: str = Field(..., description="ObjectId of first model")
+    model_b_id: str = Field(..., description="ObjectId of second model")
     mode: Literal["best_of", "rapid", "blitz", "bullet"] = "rapid"
     time_control: int = Field(default=10, ge=1, description="Time control in minutes")
-    white_side: Optional[str] = None  # Which model plays white
+    white_side: Optional[str] = None
 
 
 class MatchResponse(BaseModel):
@@ -31,7 +37,15 @@ class MatchResponse(BaseModel):
     ended_at: Optional[datetime] = None
 
 
-# Move Schemas
+class MatchListResponse(BaseModel):
+    matches: List[MatchResponse]
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Move schemas
+# ---------------------------------------------------------------------------
+
 class MoveCreate(BaseModel):
     move_san: str = Field(..., description="Move in SAN notation, e.g., 'e4' or 'Nf3'")
     match_id: str = Field(..., description="ID of the match")
@@ -51,7 +65,15 @@ class MoveResponse(BaseModel):
     timestamp: datetime
 
 
-# Model Schemas
+class MoveListResponse(BaseModel):
+    moves: List[MoveResponse]
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Model schemas
+# ---------------------------------------------------------------------------
+
 class ModelCreate(BaseModel):
     name: str = Field(..., description="Model display name")
     provider: str = Field(default="openrouter", description="AI provider")
@@ -70,7 +92,15 @@ class ModelResponse(BaseModel):
     updated_at: datetime
 
 
-# Benchmark Schemas
+class ModelListResponse(BaseModel):
+    models: List[ModelResponse]
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Benchmark schemas
+# ---------------------------------------------------------------------------
+
 class BenchmarkCreate(BaseModel):
     model_id: str
     match_id: str
@@ -93,7 +123,22 @@ class BenchmarkResponse(BaseModel):
     timestamp: datetime
 
 
-# Game Status Response
+class BenchmarkRankingResponse(BaseModel):
+    model_id: str
+    model_name: str
+    elo_estimate: float
+    total_games: int
+    wins: int
+    losses: int
+    draws: int
+    win_rate: float
+    rank: int
+
+
+# ---------------------------------------------------------------------------
+# Game status
+# ---------------------------------------------------------------------------
+
 class GameStatusResponse(BaseModel):
     status: Literal["active", "finished", "abandoned"]
     winner: Optional[str] = None
@@ -101,3 +146,23 @@ class GameStatusResponse(BaseModel):
     is_stalemate: bool = False
     is_insufficient_material: bool = False
     move_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Generic API response
+# ---------------------------------------------------------------------------
+
+class APIResponse(BaseModel):
+    """Standard envelope for all API responses."""
+
+    success: bool = True
+    message: str = "OK"
+    data: Optional[dict] = None
+
+    @classmethod
+    def ok(cls, data: dict = None, message: str = "OK") -> "APIResponse":
+        return cls(success=True, message=message, data=data)
+
+    @classmethod
+    def error(cls, message: str, data: dict = None) -> "APIResponse":
+        return cls(success=False, message=message, data=data)

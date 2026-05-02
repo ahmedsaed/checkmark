@@ -27,7 +27,20 @@ Build **Checkmark** - an AI chess benchmarking platform where AI agents play che
 
 ## 3. APPROACH OVERVIEW
 
-**Architecture:** Client-Server with MongoDB backend. Frontend provides visualization and controls, Backend handles chess logic, AI model orchestration, and benchmarking.
+**Architecture:** Client-Server with MongoDB backend. Two distinct frontend entry points:
+- **Admin Portal** (`/admin/*`) — Locked behind authentication. Used to register models, create matches, and monitor the game loop.
+- **Public Site** (`/*`) — Open to anyone. Browse active matches, view finished games with interactive boards, explore model rankings and benchmark data.
+
+**Design System:**
+- **Theme:** Dark black theme (`bg-black`, `bg-zinc-950`, `bg-zinc-900`) with zinc/gray palette for surfaces, white text, accent colors (blue for primary actions, green for wins/active, red for losses, yellow for draws).
+- **Framework:** Tailwind CSS + shadcn/ui component library for consistent, accessible UI primitives (cards, tables, dialogs, forms, badges, buttons).
+- **Layout:** Consistent top navigation bar, centered content container (`max-w-7xl mx-auto`), card-based information grouping, responsive grid layouts.
+- **Typography:** Clean hierarchy — large bold headings, readable body text, monospace for FEN strings and move notation.
+
+**Authentication:**
+- Admin area protected by simple hardcoded credentials (username + password from environment variables).
+- Public pages require no authentication.
+- Admin session managed via HTTP-only cookies with Next.js route handlers.
 
 **Chess Libraries:**
 - Backend: `python-chess` for move validation, FEN handling, game rules
@@ -50,22 +63,24 @@ Build **Checkmark** - an AI chess benchmarking platform where AI agents play che
 
 ## 4. IMPLEMENTATION STEPS
 
-### Phase 1: Project Setup and Dependencies
+### Phase 1: Project Setup and Dependencies ✅ COMPLETED
 
 **Goal:** Initialize project structure and install all necessary dependencies.
 
 **Steps:**
-1.1. Create Next.js frontend project (App Router, TypeScript)
-1.2. Create FastAPI backend project (Pydantic v2, Uvicorn)
-1.3. Set up MongoDB connection with connection pooling
-1.4. Install Python chess dependencies: `python-chess`, `litellm`, `pydantic-settings`
-1.5. Install JS dependencies: `chess.js`, `react-chessboard`, `zustand` (for board state)
+1.1. ✅ Create Next.js frontend project (App Router, TypeScript, Tailwind CSS)
+1.2. ✅ Initialize shadcn/ui component library
+1.3. ✅ Create FastAPI backend project (Pydantic v2, Uvicorn)
+1.4. ✅ Set up MongoDB connection with connection pooling
+1.5. ✅ Install Python chess dependencies: `python-chess`, `litellm`, `pydantic-settings`
+1.6. ✅ Install JS dependencies: `chess.js`, `react-chessboard`, `zustand` (for board state)
+1.7. ✅ Migrate from `requirements.txt` to Poetry for dependency management
 
-**Reference:** `backend/requirements.txt`, `frontend/package.json`
+**Reference:** `backend/pyproject.toml`, `frontend/package.json`
 
 ---
 
-### Phase 2: Database Schema Design
+### Phase 2: Database Schema Design ✅ COMPLETED
 
 **Goal:** Design MongoDB collections for matches, moves, models, and benchmarks.
 
@@ -116,13 +131,16 @@ Build **Checkmark** - an AI chess benchmarking platform where AI agents play che
   id: ObjectId,
   match_id: ObjectId,
   move_number: number,
-  white_move: string, // e.g., "e4" or "Nf3"
-  black_move: string,
-  move_from: string,
-  move_to: string,
+  san: string, // e.g., "e4" or "Nf3"
+  uci: string, // e.g., "e2e4"
+  from_square: string,
+  to_square: string,
   promotion: string | null,
   is_check: boolean,
   is_checkmate: boolean,
+  is_castling: boolean,
+  is_en_passant: boolean,
+  thinking_time_ms: number | null,
   timestamp: Date
 }
 ```
@@ -251,34 +269,51 @@ Build **Checkmark** - an AI chess benchmarking platform where AI agents play che
 
 ---
 
-### Phase 7: Frontend Implementation
+### Phase 7: Frontend — Public Site (Open Access)
 
-**Goal:** Build Next.js interface for viewing and managing chess games.
+**Goal:** Build a polished dark-themed public interface for browsing matches, viewing games, and exploring model rankings.
 
-**Components:**
+**Design:** Dark black theme (`bg-black` / `bg-zinc-950`), shadcn/ui components, consistent layout with top nav bar, centered content (`max-w-7xl mx-auto`), card-based grouping.
 
-**7.1 Dashboard:**
-- List of active matches with status
-- Recent benchmark results
-- Model rankings with Elo estimates
+**Pages & Components:**
 
-**7.2 Match Viewer:**
+**7.1 Landing Page (`/`):**
+- Hero section with platform tagline
+- Two CTA buttons: "View Dashboard" and "Browse Matches"
+- Dark gradient background
+
+**7.2 Public Dashboard (`/dashboard`):**
+- Active matches grid (model names, status badge, move count)
+- Model rankings table (rank, name, ELO, games played, win rate)
+- Recent finished matches with winner highlighted
+- Color-coded status badges (green = active, gray = finished)
+
+**7.3 Match List (`/matches`):**
+- Paginated list of all matches (active + finished)
+- Filter by status (active / finished)
+- Filter by model
+- Click into match detail view
+
+**7.4 Match Detail (`/matches/[matchId]`):**
 - Interactive chessboard using `react-chessboard`
-- Move list with timestamps
-- Game status display
-- "Refresh Board" button to sync with backend state
+- Move list with SAN notation, timestamps, and thinking time
+- Game status header (active / checkmate / stalemate / draw)
+- Player cards showing both models with win/loss indicators
+- FEN string displayed in monospace
+- "Load Position" button to replay from any move
 
-**7.3 Model Management:**
-- List of registered models
-- Add/edit model configuration (OpenRouter endpoint, capabilities)
-- View benchmark statistics per model
+**7.5 Models Page (`/models`):**
+- Model cards in responsive grid
+- Each card: name, provider, ELO, wins/losses/draws, win rate bar
+- Click into model detail for head-to-head record and benchmark history
 
-**7.4 Settings:**
-- API keys configuration (OpenRouter)
-- Default time controls
-- Match mode preferences
+**7.6 Model Detail (`/models/[modelId]`):**
+- Overview stats (ELO, total games, win rate)
+- Head-to-head table vs other models
+- Benchmark history chart (ELO over time)
+- Recent match results
 
-**Reference:** `frontend/components/`, `frontend/app/`
+**Reference:** `frontend/app/`, `frontend/components/ui/` (shadcn), `frontend/components/chess/`
 
 ---
 
