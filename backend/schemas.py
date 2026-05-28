@@ -81,6 +81,12 @@ class ModelCreate(BaseModel):
     capabilities: Optional[dict] = Field(default_factory=dict)
 
 
+class ModelUpdate(BaseModel):
+    name: Optional[str] = Field(None, description="Model display name")
+    provider: Optional[str] = Field(None, description="AI provider")
+    model_id: Optional[str] = Field(None, description="Model identifier, e.g., 'anthropic/claude-3.5'")
+
+
 class ModelResponse(BaseModel):
     id: str
     name: str

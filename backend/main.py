@@ -17,21 +17,20 @@ from utils.mongo_db import get_database, close_database
 from middleware.move_validation import MoveValidationMiddleware
 from auth import (
     get_current_user,
-    verify_password,
-    hash_password,
     create_access_token,
+    verify_password,
     LoginRequest,
     LoginResponse,
-    ChangePasswordRequest,
 )
 from schemas import (
     MatchCreate,
     MoveCreate,
     ModelCreate,
+    ModelUpdate,
+    ModelResponse,
     BenchmarkCreate,
     MatchResponse,
     MoveResponse,
-    ModelResponse,
     BenchmarkResponse,
     GameStatusResponse,
     MatchListResponse,
@@ -108,28 +107,19 @@ async def root():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, db=Depends(get_db)):
     """Authenticate admin and return a JWT access token."""
-    if request.username != settings.admin_username or request.password != settings.admin_password:
+    admins_col = db["admins"]
+    admin_doc = await admins_col.find_one({"username": request.username})
+    
+    if not admin_doc or not verify_password(request.password, admin_doc["password_hash"]):
         raise HTTPException(
             status_code=401,
             detail="Invalid username or password",
         )
-    token = create_access_token(subject="admin")
+    
+    token = create_access_token(subject=admin_doc["username"])
     return LoginResponse(access_token=token)
-
-
-@app.post("/api/auth/change-password")
-async def change_password(
-    request: ChangePasswordRequest,
-    user: dict = Depends(get_current_user),
-):
-    """Change the admin password (requires authentication)."""
-    if request.username != settings.admin_username or request.current_password != settings.admin_password:
-        raise HTTPException(status_code=403, detail="Current credentials invalid")
-    # In production, store the hashed password in a secure location
-    # For now, we just update the env var conceptually
-    return {"message": "Password change requires persistent storage (not yet implemented)"}
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +271,63 @@ async def get_model(
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     return model
+
+
+@app.put("/api/models/{model_id}", response_model=ModelResponse)
+async def update_model(
+    model_id: str,
+    model_data: ModelUpdate,
+    user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+    service: AIModelService = Depends(get_ai_model_service),
+):
+    """Update a model's metadata (name, provider, model_id only)"""
+    # Get existing model to verify it exists
+    existing = await service.get_model(model_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Model not found")
+    
+    # Only allow updating these fields
+    updates = {}
+    if model_data.name is not None:
+        updates["name"] = model_data.name
+    if model_data.provider is not None:
+        updates["provider"] = model_data.provider
+    if model_data.model_id is not None:
+        updates["model_id"] = model_data.model_id
+    
+    if not updates:
+        # No updates provided, return existing model
+        return existing
+    
+    try:
+        updated = await service.update_model(model_id, updates)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update model")
+        return updated
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/models/{model_id}")
+async def delete_model(
+    model_id: str,
+    user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Delete a model"""
+    models_col = db["models"]
+    
+    from bson import ObjectId
+    try:
+        result = await models_col.delete_one({"_id": ObjectId(model_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid model ID")
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Model not found")
+    
+    return {"success": True, "message": f"Model '{model_id}' deleted"}
 
 
 # ---------------------------------------------------------------------------
