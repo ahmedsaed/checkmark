@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = "changeme"
 
+    # JWT
+    jwt_secret: str = ""
+
     # CORS
     cors_origins: str = "http://localhost:3000"
 

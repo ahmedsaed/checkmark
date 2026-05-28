@@ -7,18 +7,15 @@ lifecycle (connect on first use, close on shutdown).
 
 from typing import Optional, Any
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-import os
+from config import settings
 
 
 class MongoDBConfig:
     """Singleton MongoDB connection manager."""
 
     def __init__(self):
-        self.connection_string = os.getenv(
-            "MONGODB_URI",
-            "mongodb://localhost:27017"
-        )
-        self.database_name = os.getenv("MONGODB_DATABASE", "checkmark")
+        self.connection_string = settings.mongodb_uri
+        self.database_name = settings.mongodb_database
         self._client: Optional[AsyncIOMotorClient] = None
         self._db: Optional[AsyncIOMotorDatabase] = None
 
@@ -37,7 +34,7 @@ class MongoDBConfig:
     async def disconnect(self) -> None:
         """Close MongoDB connection."""
         if self._client:
-            self._client.close()
+            await self._client.close()
             self._client = None
             self._db = None
 

@@ -5,12 +5,13 @@ against the current board state before they reach the business logic layer.
 Invalid moves return structured errors with legal alternatives.
 """
 
+import json
 from typing import Dict, Any, Optional, List
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
-import time
+import anyio
 import logging
 
 from services.chess_engine import ChessEngine
@@ -51,9 +52,13 @@ class MoveValidationMiddleware(BaseHTTPMiddleware):
 
             match_id = path_parts[3]  # /api/matches/{match_id}/moves
 
-            # Parse request body
-            body = await request.json()
+            # Parse request body and re-attach it so the handler can read it too
+            body_bytes = await request.body()
+            body = json.loads(body_bytes) if body_bytes else {}
             move_san = body.get("move_san", "")
+
+            # Re-attach the body so downstream handlers can read it
+            await request._receive({"type": "http.request", "body": body_bytes})
 
             if not move_san:
                 return JSONResponse(

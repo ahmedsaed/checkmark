@@ -54,25 +54,36 @@ project/
 
 ### Backend Setup
 
+#### Option 1: Using Poetry (Recommended)
+
 1. Install dependencies:
 ```bash
 cd backend
-pip install -r requirements.txt
+poetry install
 ```
 
-2. Set environment variables:
+2. Set environment variables (create a `.env` file):
 ```bash
-export OPENROUTER_API_KEY="your_api_key_here"
-export MONGODB_URI="mongodb://localhost:27017"
-export MONGODB_DATABASE="checkmark"
+OPENROUTER_API_KEY=your_api_key_here
+MONGODB_URI=mongodb://localhost:27017
+MONGODB_DATABASE=checkmark
 ```
 
 3. Run the server:
 ```bash
-python main.py
+poetry run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 The backend will be available at `http://localhost:8000`
+
+#### Option 2: Using Docker Compose (Recommended for development)
+
+1. Start all services (MongoDB + Backend):
+```bash
+docker compose up
+```
+
+2. The backend will be available at `http://localhost:8000` and MongoDB at `mongodb://localhost:27017`
 
 ### Frontend Setup
 

@@ -15,6 +15,15 @@ from services.match_service import MatchService
 from services.ai_model_service import AIModelService
 from utils.mongo_db import get_database, close_database
 from middleware.move_validation import MoveValidationMiddleware
+from auth import (
+    get_current_user,
+    verify_password,
+    hash_password,
+    create_access_token,
+    LoginRequest,
+    LoginResponse,
+    ChangePasswordRequest,
+)
 from schemas import (
     MatchCreate,
     MoveCreate,
@@ -58,8 +67,6 @@ async def get_ai_model_service():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup and cleanup on shutdown"""
-    # Add move validation middleware at startup
-    app.add_middleware(MoveValidationMiddleware)
     # MongoDB connection is lazy — first call to get_database() connects
     yield
     # Cleanup on shutdown
@@ -82,6 +89,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add move validation middleware
+app.add_middleware(MoveValidationMiddleware)
+
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -94,12 +104,42 @@ async def root():
 
 
 # ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    """Authenticate admin and return a JWT access token."""
+    if request.username != settings.admin_username or request.password != settings.admin_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+    token = create_access_token(subject="admin")
+    return LoginResponse(access_token=token)
+
+
+@app.post("/api/auth/change-password")
+async def change_password(
+    request: ChangePasswordRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Change the admin password (requires authentication)."""
+    if request.username != settings.admin_username or request.current_password != settings.admin_password:
+        raise HTTPException(status_code=403, detail="Current credentials invalid")
+    # In production, store the hashed password in a secure location
+    # For now, we just update the env var conceptually
+    return {"message": "Password change requires persistent storage (not yet implemented)"}
+
+
+# ---------------------------------------------------------------------------
 # Match endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/api/matches", response_model=MatchResponse)
 async def create_match(
     match_data: MatchCreate,
+    user: dict = Depends(get_current_user),
     db=Depends(get_db),
     service: MatchService = Depends(get_match_service),
 ):
@@ -173,6 +213,7 @@ async def get_match_status(
 async def make_move(
     match_id: str,
     move_data: MoveCreate,
+    user: dict = Depends(get_current_user),
     db=Depends(get_db),
     service: MatchService = Depends(get_match_service),
     chess_engine=Depends(get_chess_engine),
@@ -199,6 +240,7 @@ async def make_move(
 @app.post("/api/models", response_model=ModelResponse)
 async def create_model(
     model_data: ModelCreate,
+    user: dict = Depends(get_current_user),
     db=Depends(get_db),
     service: AIModelService = Depends(get_ai_model_service),
 ):
@@ -248,6 +290,7 @@ async def get_model(
 @app.post("/api/benchmarks", response_model=BenchmarkResponse)
 async def create_benchmark(
     benchmark_data: BenchmarkCreate,
+    user: dict = Depends(get_current_user),
     db=Depends(get_db),
     service: AIModelService = Depends(get_ai_model_service),
 ):
