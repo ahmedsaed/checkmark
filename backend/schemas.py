@@ -15,11 +15,10 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 
 class MatchCreate(BaseModel):
-    model_a_id: str = Field(..., description="ObjectId of first model")
-    model_b_id: str = Field(..., description="ObjectId of second model")
+    model_a_id: str = Field(..., description="ObjectId of first model (plays White)")
+    model_b_id: str = Field(..., description="ObjectId of second model (plays Black)")
     mode: Literal["best_of", "rapid", "blitz", "bullet"] = "rapid"
-    time_control: int = Field(default=10, ge=1, description="Time control in minutes")
-    white_side: Optional[str] = None
+    max_moves: int = Field(default=100, ge=1, le=1000, description="Maximum moves per game")
 
 
 class MatchResponse(BaseModel):
@@ -27,13 +26,13 @@ class MatchResponse(BaseModel):
     model_a_id: str
     model_b_id: str
     mode: str
-    time_control: int
-    white_side: Optional[str]
+    time_control: Optional[int] = None
+    white_side: Optional[str] = None
     status: str = "active"
     winner_id: Optional[str] = None
     total_moves: int = 0
     board_fen: Optional[str] = None
-    started_at: datetime
+    started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
 
 
@@ -42,32 +41,7 @@ class MatchListResponse(BaseModel):
     total: int
 
 
-# ---------------------------------------------------------------------------
-# Move schemas
-# ---------------------------------------------------------------------------
 
-class MoveCreate(BaseModel):
-    move_san: str = Field(..., description="Move in SAN notation, e.g., 'e4' or 'Nf3'")
-    match_id: str = Field(..., description="ID of the match")
-    white_move: bool = Field(default=True, description="Is this white's move?")
-
-
-class MoveResponse(BaseModel):
-    success: bool
-    move_number: int
-    move_from: Optional[str] = None
-    move_to: Optional[str] = None
-    promotion: Optional[str] = None
-    is_check: bool = False
-    is_checkmate: bool = False
-    is_stalemate: bool = False
-    board_fen: Optional[str] = None
-    timestamp: datetime
-
-
-class MoveListResponse(BaseModel):
-    moves: List[MoveResponse]
-    total: int
 
 
 # ---------------------------------------------------------------------------

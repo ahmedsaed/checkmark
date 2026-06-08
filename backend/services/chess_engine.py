@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import uuid
 
 
-@dataclass
 class ChessEngine:
     """
     Chess engine providing board state management, move validation,
@@ -64,7 +63,8 @@ class ChessEngine:
         Returns:
             Board: New board state after move
         """
-        return board.push_san(san)
+        board.push_san(san)
+        return board
 
     def pop_move(self, board: Board) -> Board:
         """
@@ -122,10 +122,10 @@ class ChessEngine:
         is_checkmate = board.is_checkmate()
         is_stalemate = board.is_stalemate()
         is_insufficient = board.is_insufficient_material()
-        is_draw = board.is_draw()
+        is_draw = board.can_claim_draw() or (board.halfmove_clock >= 100)
         
         if is_checkmate:
-            winner = 'white' if board.turn == COLOR_BLACK else 'black'
+            winner = 'white' if board.turn == BLACK else 'black'
             return {
                 'status': 'checkmate',
                 'is_check': True,
@@ -133,7 +133,7 @@ class ChessEngine:
                 'is_stalemate': False,
                 'is_insufficient_material': False,
                 'winner': winner,
-                'move_count': board.turn_count
+                'move_count': board.fullmove_number
             }
         elif is_stalemate:
             return {
@@ -143,7 +143,7 @@ class ChessEngine:
                 'is_stalemate': True,
                 'is_insufficient_material': False,
                 'winner': None,
-                'move_count': board.turn_count
+                'move_count': board.fullmove_number
             }
         elif is_insufficient:
             return {
@@ -153,7 +153,7 @@ class ChessEngine:
                 'is_stalemate': False,
                 'is_insufficient_material': True,
                 'winner': None,
-                'move_count': board.turn_count
+                'move_count': board.fullmove_number
             }
         elif is_draw:
             return {
@@ -163,7 +163,7 @@ class ChessEngine:
                 'is_stalemate': False,
                 'is_insufficient_material': False,
                 'winner': None,
-                'move_count': board.turn_count
+                'move_count': board.fullmove_number
             }
         else:
             return {
@@ -173,7 +173,7 @@ class ChessEngine:
                 'is_stalemate': False,
                 'is_insufficient_material': False,
                 'winner': None,
-                'move_count': board.turn_count
+                'move_count': board.fullmove_number
             }
 
     def validate_move(self, board: Board, san: str) -> tuple[bool, Optional[List[str]]]:

@@ -34,7 +34,7 @@ class MongoDBConfig:
     async def disconnect(self) -> None:
         """Close MongoDB connection."""
         if self._client:
-            await self._client.close()
+            self._client.close()
             self._client = None
             self._db = None
 

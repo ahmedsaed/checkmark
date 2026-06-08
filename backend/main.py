@@ -8,13 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import List
 from datetime import datetime
+import asyncio
 
 # Import services
 from services.chess_engine import ChessEngine
 from services.match_service import MatchService
 from services.ai_model_service import AIModelService
 from utils.mongo_db import get_database, close_database
-from middleware.move_validation import MoveValidationMiddleware
+import logging
 from auth import (
     get_current_user,
     create_access_token,
@@ -24,13 +25,11 @@ from auth import (
 )
 from schemas import (
     MatchCreate,
-    MoveCreate,
     ModelCreate,
     ModelUpdate,
     ModelResponse,
     BenchmarkCreate,
     MatchResponse,
-    MoveResponse,
     BenchmarkResponse,
     GameStatusResponse,
     MatchListResponse,
@@ -88,8 +87,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add move validation middleware
-app.add_middleware(MoveValidationMiddleware)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("logs/matchmaking.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("checkmark")
 
 
 # ---------------------------------------------------------------------------
@@ -133,15 +140,20 @@ async def create_match(
     db=Depends(get_db),
     service: MatchService = Depends(get_match_service),
 ):
-    """Create a new match between two models"""
+    """Create a new match between two models and start auto-play"""
     try:
         match = await service.create_match(
             model_a_id=match_data.model_a_id,
             model_b_id=match_data.model_b_id,
             mode=match_data.mode,
-            time_control=match_data.time_control,
-            white_side=match_data.white_side,
+            max_moves=match_data.max_moves,
         )
+        
+        # Start background auto-play task (fire-and-forget)
+        asyncio.create_task(
+            service.auto_play_match(match["id"], max_moves=match_data.max_moves)
+        )
+        
         return match
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -197,30 +209,6 @@ async def get_match_status(
         is_insufficient_material=status_info.get("is_insufficient_material", False),
         move_count=status_info["move_count"],
     )
-
-
-@app.post("/api/matches/{match_id}/moves", response_model=MoveResponse)
-async def make_move(
-    match_id: str,
-    move_data: MoveCreate,
-    user: dict = Depends(get_current_user),
-    db=Depends(get_db),
-    service: MatchService = Depends(get_match_service),
-    chess_engine=Depends(get_chess_engine),
-):
-    """Execute a move in the game"""
-    try:
-        move_result = await service.make_move(
-            match_id=match_id,
-            san=move_data.move_san,
-            white_move=move_data.white_move,
-            chess_engine=chess_engine,
-        )
-        return move_result
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

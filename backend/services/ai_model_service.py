@@ -1,16 +1,20 @@
 """
 AI Model Service for Checkmark Platform
 Handles AI model integration with LiteLLM/OpenRouter and MongoDB persistence.
+Supports tool-calling agents for chess move generation.
 """
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-import litellm
-from litellm import completion
 import os
 import json
+import logging
+import asyncio
 from datetime import datetime
 from bson import ObjectId
+import litellm
+
+logger = logging.getLogger("checkmark")
 
 
 @dataclass
@@ -34,57 +38,38 @@ class MoveSuggestion:
     evaluation: str = ""
 
 
+# System prompt for chess AI agents
+CHESS_SYSTEM_PROMPT = """You are a chess playing AI. You play by calling tools to interact with the chess board.
+
+Available Tools:
+1. get_board_state() - Get the current board position
+   Input: No arguments
+   Returns: { "fen": "...", "turn": "white" or "black" }
+
+2. make_move(move: str) - Make a move in SAN notation (e.g., "e4", "Nf3", "O-O")
+   Input: One string argument - the move in SAN notation
+   Returns: { "success": true, "new_fen": "...", "turn": "black" }
+   OR: { "success": false, "error": "Illegal move: e5 is not legal" }
+
+Rules:
+- Always call get_board_state() first to see the position and whose turn it is
+- Call make_move() with a legal SAN notation move
+- If make_move() returns success: false, analyze the error and try a different move
+- You have a maximum of 20 tool calls per turn
+- Don't repeat the same illegal moves
+- The move MUST be in SAN notation (Standard Algebraic Notation)
+- Examples of valid moves: "e4", "Nf3", "O-O", "Bxd5+", "Qxf7#"
+"""
+
+
 class AIModelService:
     """Service for interacting with AI models via LiteLLM/OpenRouter with MongoDB persistence."""
-
-    # Prompt templates for chess reasoning
-    MOVE_SUGGESTION_PROMPT = """You are a chess playing AI. Analyze the following chess position and suggest the best move.
-
-Current Position (FEN): {fen}
-Whose Turn: {turn}
-
-Please analyze the position and provide:
-1. The best move in SAN notation (e.g., "e4", "Nf3", "Qxf7+")
-2. A brief reasoning for your choice
-3. Your evaluation of the position
-
-IMPORTANT: The move MUST be legal. Do not suggest illegal moves.
-
-Format your response as JSON:
-{{
-  "move": "SAN notation of the move",
-  "reasoning": "Brief explanation",
-  "evaluation": "Position evaluation"
-}}
-"""
-
-    POSITION_EVALUATION_PROMPT = """You are a chess evaluation AI. Analyze the following position and provide an evaluation.
-
-Current Position (FEN): {fen}
-
-Provide:
-1. Material balance (if any)
-2. Positional assessment
-3. Recommended plan
-4. Your evaluation in centipawns (positive = advantage for White, negative = advantage for Black)
-
-Format your response as JSON:
-{{
-  "material_balance": "Material assessment",
-  "positional_assessment": "Positional evaluation",
-  "recommended_plan": "Strategic recommendations",
-  "evaluation_cents": 0
-}}
-"""
 
     def __init__(self):
         """Initialize AI model service with API configuration"""
         self.api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("LITELLM_API_KEY")
         
-        if not self.api_key:
-            self.use_mock = True
-        else:
-            self.use_mock = False
+        if self.api_key:
             litellm.api_key = self.api_key
             litellm.model_list = [
                 {
@@ -291,193 +276,425 @@ Format your response as JSON:
         }
 
     # ------------------------------------------------------------------
-    # AI move suggestion (LiteLLM/OpenRouter)
+    # Tool definitions
     # ------------------------------------------------------------------
 
-    def get_model_config(self, model_name: str) -> ModelConfig:
-        """Get configuration for a specific model."""
-        if "/" in model_name:
-            provider, model_id = model_name.split("/", 1)
-        else:
-            provider = "openrouter"
-            model_id = model_name
-
-        model_specs = {
-            "anthropic/claude-3.5": {"temperature": 0.7, "max_tokens": 1024},
-            "google/gemini-1.5-pro": {"temperature": 0.7, "max_tokens": 2048},
-            "mistralai/mistral-7b": {"temperature": 0.7, "max_tokens": 512},
-            "openai/gpt-4o": {"temperature": 0.7, "max_tokens": 1024},
-        }
-
-        specs = model_specs.get(model_id, {})
-        return ModelConfig(
-            name=model_name,
-            provider=provider,
-            model_id=model_id,
-            temperature=specs.get("temperature", 0.7),
-            max_tokens=specs.get("max_tokens", 1024),
-        )
-
-    def generate_move_suggestion(
-        self,
-        board_fen: str,
-        match_id: str,
-        model_name: str = "openrouter/anthropic/claude-3.5",
-        max_retries: int = 3,
-    ) -> Optional[MoveSuggestion]:
-        """Get AI's move suggestion for a given position with retry logic.
-
-        Args:
-            board_fen: Current board FEN string.
-            match_id: ID of the match.
-            model_name: Model to use for move suggestion.
-            max_retries: Maximum number of retry attempts (default 3).
-
-        Returns:
-            MoveSuggestion or None if all retries fail.
-        """
-        last_error = None
-
-        for attempt in range(max_retries):
-            try:
-                if self.use_mock:
-                    return self._mock_move_suggestion()
-
-                config = self.get_model_config(model_name)
-                prompt = self._prepare_move_prompt(board_fen, match_id)
-
-                response = completion(
-                    model=config.model_id,
-                    messages=[
-                        {"role": "system", "content": "You are a chess expert AI. Provide your response as valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=config.temperature,
-                    max_tokens=config.max_tokens,
-                )
-
-                try:
-                    result = json.loads(response.choices[0].message.content)
-                    return MoveSuggestion(
-                        move_san=result.get("move", ""),
-                        reasoning=result.get("reasoning", ""),
-                        evaluation=result.get("evaluation", ""),
-                    )
-                except json.JSONDecodeError:
-                    return self._extract_move_from_text(response.choices[0].message.content)
-
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 1s, 2s, 4s
-                    import time
-                    time.sleep(2 ** attempt)
-                    continue
-                break
-
-        print(f"Error generating move suggestion after {max_retries} attempts: {last_error}")
-        return None
-
-    def _prepare_move_prompt(self, board_fen: str, match_id: str) -> str:
-        """Prepare the move suggestion prompt."""
-        # FEN format: last character after the board is 'w' (white) or 'b' (black)
-        parts = board_fen.split()
-        turn = parts[1] if len(parts) > 1 else "w"
-        turn_name = "White" if turn == "w" else "Black"
-        return self.MOVE_SUGGESTION_PROMPT.format(fen=board_fen, turn=turn_name)
-
-    def _mock_move_suggestion(self) -> MoveSuggestion:
-        """Mock move suggestion for development."""
-        return MoveSuggestion(
-            move_san="e4",
-            reasoning="Opening principle: control the center",
-            evaluation="Equal position",
-            is_legal=True,
-            confidence=0.85,
-        )
-
-    def _extract_move_from_text(self, text: str) -> Optional[MoveSuggestion]:
-        """Extract move from unstructured text response."""
-        import re
-        move_patterns = [
-            r'"move"[^\]]*:\s*"([^"]+)"',
-            r'Move:\s*([a-h][1-8][a-h][1-8]|[A-Za-z][a-h][=x#?])',
+    def get_chess_tools(self) -> List[Dict[str, Any]]:
+        """Define the chess tools for the AI agent."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_board_state",
+                    "description": "Get the current chess board position and whose turn it is.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "make_move",
+                    "description": "Make a chess move in SAN notation (e.g., 'e4', 'Nf3', 'O-O'). Returns success/failure.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "move": {
+                                "type": "string",
+                                "description": "The move in SAN notation (e.g., 'e4', 'Nf3', 'O-O', 'Bxd5+')",
+                            },
+                        },
+                        "required": ["move"],
+                    },
+                },
+            },
         ]
 
-        for pattern in move_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                move = match.group(1)
-                return MoveSuggestion(
-                    move_san=move,
-                    reasoning="Extracted from model response",
-                    is_legal=True,
-                    confidence=0.5,
-                )
+    # ------------------------------------------------------------------
+    # Tool execution (called by match_service during auto-play)
+    # ------------------------------------------------------------------
 
-        return None
-
-    def evaluate_position(
-        self,
-        board_fen: str,
-        model_name: str = "openrouter/anthropic/claude-3.5",
-        max_retries: int = 3,
-    ) -> Optional[Dict[str, Any]]:
-        """Get AI's evaluation of a chess position with retry logic.
+    async def execute_get_board_state(self, match_id: str) -> Dict[str, Any]:
+        """Execute the get_board_state tool.
 
         Args:
-            board_fen: Current board FEN string.
-            model_name: Model to use for evaluation.
-            max_retries: Maximum number of retry attempts (default 3).
+            match_id: ID of the match.
 
         Returns:
-            Dict with evaluation or None if all retries fail.
+            Dict with fen and turn information.
         """
-        last_error = None
+        db = await self._get_db()
+        matches_col = db["matches"]
+        
+        match_doc = await matches_col.find_one({"_id": ObjectId(match_id)})
+        if not match_doc:
+            return {"error": f"Match {match_id} not found"}
+        
+        fen = match_doc.get("board_fen", "")
+        # Parse FEN to determine turn (w=white, b=black)
+        turn = "white" if fen.split()[1] == "w" else "black"
+        
+        return {"fen": fen, "turn": turn}
 
-        for attempt in range(max_retries):
+    async def execute_make_move(self, match_id: str, move: str) -> Dict[str, Any]:
+        """Execute the make_move tool.
+
+        Args:
+            match_id: ID of the match.
+            move: The move in SAN notation.
+
+        Returns:
+            Dict with success status and new board state.
+        """
+        try:
+            from services.match_service import MatchService
+            from services.chess_engine import ChessEngine
+            
+            chess_engine = ChessEngine()
+            match_service = MatchService(chess_engine)
+            
+            # Execute the move (this validates and records it)
+            result = await match_service.make_move(match_id, move)
+            
+            if result.get("success"):
+                new_fen = result.get("board_fen", "")
+                # Determine next turn
+                move_number = result.get("move_number", 0)
+                next_turn = "black" if move_number % 2 == 1 else "white"
+                
+                return {
+                    "success": True,
+                    "new_fen": new_fen,
+                    "turn": next_turn,
+                    "move_number": move_number,
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "Unknown error occurred",
+                }
+                
+        except ValueError as e:
+            # Illegal move
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Error executing make_move tool: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "success": False,
+                "error": f"Tool execution error: {str(e)}",
+            }
+
+    # ------------------------------------------------------------------
+    # Tool-calling move generation
+    # ------------------------------------------------------------------
+
+    async def generate_move_with_tools(
+        self,
+        match_id: str,
+        model_id: str,
+        max_tool_calls: int = 20,
+    ) -> Optional[str]:
+        """Generate a move using tool-calling with LiteLLM.
+
+        This method implements a tool-calling agent loop where:
+        1. The AI agent calls tools to get board state and make moves
+        2. We execute the tools and return results to the agent
+        3. The agent continues until it makes a valid move or max_tool_calls is reached
+
+        Args:
+            match_id: ID of the match.
+            model_id: Model ID to use for move generation (UUID stored in DB).
+            max_tool_calls: Maximum number of tool calls allowed per turn (default 20).
+
+        Returns:
+            The SAN notation of the move if successful, None otherwise.
+        """
+        # Look up the model to get its configuration
+        db = await self._get_db()
+        models_col = db["models"]
+        model = await models_col.find_one({"_id": ObjectId(model_id)})
+        
+        if not model:
+            logger.error(f"Model {model_id} not found in database")
+            return None
+        
+        model_name = model.get("name", model_id)
+        provider = model.get("provider", "openrouter")
+        display_name = model.get("model_id", model_id)
+        
+        logger.info(f"Model {model_name} ({display_name}) starting tool-calling turn for match {match_id}")
+        
+        # Initialize conversation history
+        messages = [
+            {"role": "system", "content": CHESS_SYSTEM_PROMPT},
+            {"role": "user", "content": "It's your turn. Please call get_board_state() to see the position."},
+        ]
+        
+        tool_calls_count = 0
+        last_move_attempted = None
+        
+        while tool_calls_count < max_tool_calls:
+            tool_calls_count += 1
+            
             try:
-                if self.use_mock:
-                    return self._mock_evaluation()
-
-                config = self.get_model_config(model_name)
-                prompt = self.POSITION_EVALUATION_PROMPT.format(fen=board_fen)
-
-                response = completion(
-                    model=config.model_id,
-                    messages=[
-                        {"role": "system", "content": "You are a chess expert AI. Provide your response as valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=config.temperature,
-                    max_tokens=config.max_tokens,
-                )
-
-                try:
-                    result = json.loads(response.choices[0].message.content)
-                    return result
-                except json.JSONDecodeError:
-                    return None
-
+                # Determine the model string for litellm
+                if provider == "llama-swap":
+                    # For llama-swap, use custom text-completion tool calling
+                    move = await self._generate_move_with_llama_swap_tools(match_id, messages, tool_calls_count, max_tool_calls, model_id)
+                    if move:
+                        return move
+                else:
+                    # For OpenRouter and other providers, use litellm's tool calling
+                    model_string = f"{provider}/{display_name}" if "/" not in display_name else display_name
+                    
+                    move = await self._generate_move_with_litellm_tools(
+                        match_id, messages, model_string, tool_calls_count, max_tool_calls
+                    )
+                    if move:
+                        return move
+                    
             except Exception as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    import time
-                    time.sleep(2 ** attempt)
-                    continue
-                break
-
-        print(f"Error evaluating position after {max_retries} attempts: {last_error}")
+                logger.error(f"Error in tool-calling loop (attempt {tool_calls_count}/{max_tool_calls}): {e}")
+                
+                # Add error message to history so model knows
+                messages.append({
+                    "role": "system",
+                    "content": f"Error occurred: {str(e)}. Please try again.",
+                })
+        
+        # Max tool calls reached
+        logger.error(f"⚠️ Model {model_name} exceeded max tool calls ({max_tool_calls}) for match {match_id}")
+        logger.error(f"Last move attempted: {last_move_attempted}")
         return None
 
-    def _mock_evaluation(self) -> Dict[str, Any]:
-        """Mock position evaluation."""
-        return {
-            "material_balance": "Equal",
-            "positional_assessment": "Open position with chances for both sides",
-            "recommended_plan": "Control the center and develop pieces",
-            "evaluation_cents": 0,
-        }
+    async def _generate_move_with_litellm_tools(
+        self,
+        match_id: str,
+        messages: list,
+        model_string: str,
+        current_tool_calls: int,
+        max_tool_calls: int,
+    ) -> Optional[str]:
+        """Generate a move using litellm's tool calling API."""
+        last_move = None
+        
+        # Call litellm with tools
+        response = litellm.completion(
+            model=model_string,
+            messages=messages,
+            tools=self.get_chess_tools(),
+            tool_choice="auto",
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        
+        # Check for tool calls
+        if response.choices[0].message.tool_calls:
+            tool_calls = response.choices[0].message.tool_calls
+            messages.append(response.choices[0].message)  # Add assistant's message
+            
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                tool_call_id = tool_call.id
+                
+                logger.debug(f"Tool call #{current_tool_calls}: {function_name}({function_args})")
+                
+                # Execute the tool
+                if function_name == "get_board_state":
+                    tool_result = await self.execute_get_board_state(match_id)
+                elif function_name == "make_move":
+                    move = function_args.get("move", "")
+                    last_move = move
+                    tool_result = await self.execute_make_move(match_id, move)
+                    
+                    # If move was successful, return it
+                    if tool_result.get("success"):
+                        logger.info(f"✅ Model made valid move: {move}")
+                        return move
+                    else:
+                        logger.warning(f"❌ Model made invalid move: {move} - {tool_result.get('error')}")
+                else:
+                    tool_result = {"error": f"Unknown function: {function_name}"}
+                
+                # Add tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(tool_result),
+                })
+                
+        elif response.choices[0].message.content:
+            # Model responded with text (no tool calls)
+            assistant_content = response.choices[0].message.content
+            messages.append(response.choices[0].message)
+            
+            logger.debug(f"Model responded with text: {assistant_content[:200]}...")
+            
+            # Try to extract a SAN move from the text
+            import re
+            san_pattern = r'\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8][+#]?)\b'
+            matches = re.findall(san_pattern, assistant_content)
+            
+            if matches:
+                # Try the first match
+                potential_move = matches[0]
+                logger.info(f"Extracted potential move from text: {potential_move}")
+                
+                # Validate the move by attempting it
+                validation_result = await self.execute_make_move(match_id, potential_move)
+                if validation_result.get("success"):
+                    logger.info(f"✅ Model made valid move: {potential_move}")
+                    return potential_move
+                else:
+                    logger.warning(f"❌ Extracted move {potential_move} was invalid: {validation_result.get('error')}")
+            
+            logger.warning(f"Model made no tool calls and no extractable move (attempt {current_tool_calls}/{max_tool_calls})")
+            
+        else:
+            logger.warning(f"Model returned empty response (attempt {current_tool_calls}/{max_tool_calls})")
+            
+        return None
+
+    async def _generate_move_with_llama_swap_tools(
+        self,
+        match_id: str,
+        messages: list,
+        current_tool_calls: int,
+        max_tool_calls: int,
+        model_id: str = None,
+    ) -> Optional[str]:
+        """Generate a move using llama-swap's text completion with custom tool parsing.
+        
+        Since llama-swap doesn't support litellm's tool calling API, we need to parse
+        tool calls from the text response manually.
+        """
+        import requests
+        import re
+        
+        # Look up the model to get its display name
+        db = await self._get_db()
+        models_col = db["models"]
+        model = await models_col.find_one({"_id": ObjectId(model_id)}) if model_id else None
+        
+        if not model:
+            # Fallback to first model
+            model = await models_col.find_one()
+        
+        if not model:
+            logger.error("No models found in database")
+            return None
+        
+        model_name = model.get("name", "Unknown")
+        display_name = model.get("model_id", "OmniCoder-9B")
+        
+        # Build a text prompt for the model
+        prompt = "You are a chess playing AI.\n\n"
+        prompt += CHESS_SYSTEM_PROMPT + "\n\n"
+        
+        # Add conversation history
+        for msg in messages:
+            if msg["role"] == "user":
+                prompt += f"User: {msg['content']}\n\n"
+            elif msg["role"] == "assistant":
+                prompt += f"Assistant: {msg['content']}\n\n"
+            elif msg["role"] == "tool":
+                prompt += f"Tool Result: {msg['content']}\n\n"
+            elif msg["role"] == "system":
+                continue  # Skip system messages in text mode
+        
+        prompt += "Assistant: "
+        
+        try:
+            # Call llama-swap
+            response = requests.post(
+                "http://localhost:8080/completion",
+                json={
+                    "model": display_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "max_tokens": 1024,
+                    "temperature": 0.7,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            assistant_text = data.get("content", "")
+            
+            logger.debug(f"Llama-swap response from {model_name}: {assistant_text[:500]}...")
+            
+            # Parse tool calls from text
+            # Look for patterns like "get_board_state()" or "make_move('e4')"
+            get_board_match = re.search(r'get_board_state\s*\(\s*\)', assistant_text)
+            make_move_match = re.search(r'make_move\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', assistant_text)
+            
+            if get_board_match:
+                logger.debug(f"Detected get_board_state() call")
+                tool_result = await self.execute_get_board_state(match_id)
+                messages.append({
+                    "role": "assistant",
+                    "content": f"I'll call get_board_state().",
+                })
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(tool_result),
+                })
+                return None  # Continue the loop
+            
+            elif make_move_match:
+                move = make_move_match.group(1)
+                logger.debug(f"Detected make_move('{move}') call")
+                tool_result = await self.execute_make_move(match_id, move)
+                
+                messages.append({
+                    "role": "assistant",
+                    "content": f"I'll make the move {move}.",
+                })
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(tool_result),
+                })
+                
+                if tool_result.get("success"):
+                    logger.info(f"✅ Model {model_name} made valid move: {move}")
+                    return move
+                else:
+                    logger.warning(f"❌ Model {model_name} made invalid move: {move} - {tool_result.get('error')}")
+                    return None  # Continue the loop
+            
+            else:
+                # No tool calls detected, try to extract a move from the text
+                san_pattern = r'\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8][+#]?)\b'
+                matches = re.findall(san_pattern, assistant_text)
+                
+                if matches:
+                    potential_move = matches[0]
+                    logger.info(f"Extracted potential move from llama-swap response: {potential_move}")
+                    
+                    validation_result = await self.execute_make_move(match_id, potential_move)
+                    if validation_result.get("success"):
+                        logger.info(f"✅ Model {model_name} made valid move: {potential_move}")
+                        return potential_move
+                    else:
+                        logger.warning(f"❌ Extracted move {potential_move} was invalid: {validation_result.get('error')}")
+                
+                logger.warning(f"No tool calls or extractable moves found (attempt {current_tool_calls}/{max_tool_calls})")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request to llama-swap failed: {e}")
+        except Exception as e:
+            logger.error(f"Error processing llama-swap response: {e}")
+        
+        return None
 
     # ------------------------------------------------------------------
     # DB access
