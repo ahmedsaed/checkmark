@@ -5,10 +5,12 @@ Backend FastAPI application entry point
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from typing import List
 from datetime import datetime
 import asyncio
+import json
 
 # Import services
 from services.chess_engine import ChessEngine
@@ -65,9 +67,17 @@ async def get_ai_model_service():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup and cleanup on shutdown"""
+    global active_sse_connections
     # MongoDB connection is lazy — first call to get_database() connects
     yield
     # Cleanup on shutdown
+    logger.info(f"Shutting down {len(active_sse_connections)} SSE connections")
+    for match_id, connections in active_sse_connections.items():
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
     await close_database()
 
 
@@ -97,6 +107,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("checkmark")
+
+# Track active SSE connections per match for cleanup
+active_sse_connections: dict[str, set] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +221,107 @@ async def get_match_status(
         is_stalemate=status_info["is_stalemate"],
         is_insufficient_material=status_info.get("is_insufficient_material", False),
         move_count=status_info["move_count"],
+    )
+
+
+@app.get("/api/matches/{match_id}/stream")
+async def stream_match(
+    match_id: str,
+    service: MatchService = Depends(get_match_service),
+):
+    """SSE stream of a match. Streams all moves if finished, or keeps streaming as moves come in."""
+    match = await service.get_match(match_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    async def event_stream():
+        try:
+            from bson import ObjectId
+            db = await service._get_db()
+            moves_col = db["moves"]
+
+            def move_to_dict(doc):
+                return {
+                    "id": str(doc["_id"]),
+                    "match_id": str(doc["match_id"]),
+                    "move_number": doc["move_number"],
+                    "san": doc["san"],
+                    "uci": doc["uci"],
+                    "from_square": doc["from_square"],
+                    "to_square": doc["to_square"],
+                    "promotion": doc.get("promotion"),
+                    "is_check": doc.get("is_check", False),
+                    "is_checkmate": doc.get("is_checkmate", False),
+                    "thinking_time_ms": doc.get("thinking_time_ms"),
+                    "timestamp": doc["timestamp"].isoformat() if doc.get("timestamp") else None,
+                }
+
+            # Fetch moves already in DB
+            cursor = moves_col.find({"match_id": ObjectId(match["id"])}).sort("move_number", 1)
+            existing_moves = []
+            async for doc in cursor:
+                existing_moves.append(move_to_dict(doc))
+
+            # Track last move number we've sent
+            last_move_number = existing_moves[-1]["move_number"] if existing_moves else 0
+
+            # Send existing moves immediately
+            for move in existing_moves:
+                yield f"data: {json.dumps(move)}\n\n"
+
+            # If match is finished, send completion event and stop
+            if match.get("status") != "active":
+                yield f"data: {json.dumps({'type': 'match_end', 'status': match.get('status'), 'winner': match.get('winner_id')})}\n\n"
+                return
+
+            # Poll for new moves while match is ongoing
+            while True:
+                await asyncio.sleep(1)
+
+                # Check match status
+                current_match = await service.get_match(match_id)
+                if not current_match:
+                    yield f"data: {json.dumps({'type': 'match_removed'})}\n\n"
+                    break
+
+                # Fetch new moves
+                cursor = moves_col.find({
+                    "match_id": ObjectId(current_match["id"]),
+                    "move_number": {"$gt": last_move_number},
+                }).sort("move_number", 1)
+                new_moves = []
+                async for doc in cursor:
+                    new_moves.append(move_to_dict(doc))
+
+                # Stream new moves
+                for move in new_moves:
+                    yield f"data: {json.dumps(move)}\n\n"
+                    last_move_number = max(last_move_number, move["move_number"])
+
+                if new_moves:
+                    logger.info(f"Match {match_id}: streamed {len(new_moves)} move(s)")
+
+                # Check if match finished
+                if current_match.get("status") != "active":
+                    yield f"data: {json.dumps({'type': 'match_end', 'status': current_match.get('status'), 'winner': current_match.get('winner_id')})}\n\n"
+                    break
+
+        except GeneratorExit:
+            # Client disconnected
+            logger.info(f"Match {match_id}: SSE client disconnected")
+            return
+        except Exception as e:
+            logger.error(f"Match {match_id}: SSE stream error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

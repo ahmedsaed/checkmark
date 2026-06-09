@@ -408,6 +408,7 @@ class AIModelService:
         1. The AI agent calls tools to get board state and make moves
         2. We execute the tools and return results to the agent
         3. The agent continues until it makes a valid move or max_tool_calls is reached
+        4. Empty/non-tool responses get a nudge and don't count against the limit
 
         Args:
             match_id: ID of the match.
@@ -428,9 +429,29 @@ class AIModelService:
         
         model_name = model.get("name", model_id)
         provider = model.get("provider", "openrouter")
-        display_name = model.get("model_id", model_id)
+        model_id_str = model.get("model_id", model_id)
+        api_base = model.get("api_base")
+        api_key = model.get("api_key")
         
-        logger.info(f"Model {model_name} ({display_name}) starting tool-calling turn for match {match_id}")
+        logger.info(f"Model {model_name} ({model_id_str}) starting tool-calling turn for match {match_id}")
+        
+        # Build litellm model string based on provider
+        if provider == "llama-swap":
+            # llama-swap is OpenAI-compatible at /v1
+            litellm_model = f"openai/{model_id_str}"
+            litellm_kwargs = {
+                "api_base": "http://localhost:8080/v1",
+                "api_key": "not-needed",
+            }
+        else:
+            # OpenRouter and other providers
+            litellm_model = f"{provider}/{model_id_str}" if "/" not in model_id_str else model_id_str
+            litellm_kwargs = {}
+        
+        if api_base:
+            litellm_kwargs["api_base"] = api_base
+        if api_key:
+            litellm_kwargs["api_key"] = api_key
         
         # Initialize conversation history
         messages = [
@@ -439,40 +460,40 @@ class AIModelService:
         ]
         
         tool_calls_count = 0
-        last_move_attempted = None
         
         while tool_calls_count < max_tool_calls:
-            tool_calls_count += 1
-            
             try:
-                # Determine the model string for litellm
-                if provider == "llama-swap":
-                    # For llama-swap, use custom text-completion tool calling
-                    move = await self._generate_move_with_llama_swap_tools(match_id, messages, tool_calls_count, max_tool_calls, model_id)
-                    if move:
-                        return move
+                result = await self._generate_move_with_litellm_tools(
+                    match_id, messages, litellm_model, litellm_kwargs, tool_calls_count
+                )
+                
+                if result["move"]:
+                    return result["move"]
+                elif result["nudge"]:
+                    # Model didn't make a tool call - add nudge and retry (doesn't count)
+                    messages.append({
+                        "role": "user",
+                        "content": "[INTERNAL NOTE] You must use the get_board_state() tool to see the current board position, then use make_move() to make a move. Both tools are required to play.",
+                    })
+                elif result["invalid_move"]:
+                    # Model made an invalid move - loop continues (doesn't count as wasted)
+                    pass
                 else:
-                    # For OpenRouter and other providers, use litellm's tool calling
-                    model_string = f"{provider}/{display_name}" if "/" not in display_name else display_name
-                    
-                    move = await self._generate_move_with_litellm_tools(
-                        match_id, messages, model_string, tool_calls_count, max_tool_calls
-                    )
-                    if move:
-                        return move
+                    # Exception occurred
+                    messages.append({
+                        "role": "user",
+                        "content": "[INTERNAL NOTE] An error occurred. Please try again with get_board_state() and make_move().",
+                    })
                     
             except Exception as e:
-                logger.error(f"Error in tool-calling loop (attempt {tool_calls_count}/{max_tool_calls}): {e}")
-                
-                # Add error message to history so model knows
+                logger.error(f"Error in tool-calling loop (tool calls: {tool_calls_count}/{max_tool_calls}): {e}")
                 messages.append({
-                    "role": "system",
-                    "content": f"Error occurred: {str(e)}. Please try again.",
+                    "role": "user",
+                    "content": f"[INTERNAL NOTE] An error occurred: {str(e)}. Please try again with get_board_state() and make_move().",
                 })
         
         # Max tool calls reached
         logger.error(f"⚠️ Model {model_name} exceeded max tool calls ({max_tool_calls}) for match {match_id}")
-        logger.error(f"Last move attempted: {last_move_attempted}")
         return None
 
     async def _generate_move_with_litellm_tools(
@@ -480,11 +501,18 @@ class AIModelService:
         match_id: str,
         messages: list,
         model_string: str,
+        litellm_kwargs: dict,
         current_tool_calls: int,
-        max_tool_calls: int,
-    ) -> Optional[str]:
-        """Generate a move using litellm's tool calling API."""
-        last_move = None
+    ) -> dict:
+        """Generate a move using litellm's tool calling API.
+        
+        Returns a dict with keys:
+        - move: the SAN move if successful, else None
+        - nudge: True if model needs a nudge (no tool calls made)
+        - invalid_move: True if model made an invalid move
+        - error: True if an exception occurred
+        """
+        result = {"move": None, "nudge": False, "invalid_move": False, "error": False}
         
         # Call litellm with tools
         response = litellm.completion(
@@ -494,34 +522,43 @@ class AIModelService:
             tool_choice="auto",
             temperature=0.7,
             max_tokens=1024,
+            timeout=90,
+            **litellm_kwargs,
         )
         
+        # Increment tool calls count only when model actually uses tools
+        assistant_message = response.choices[0].message
+        
         # Check for tool calls
-        if response.choices[0].message.tool_calls:
-            tool_calls = response.choices[0].message.tool_calls
-            messages.append(response.choices[0].message)  # Add assistant's message
+        if assistant_message.tool_calls:
+            tool_calls_count = len(assistant_message.tool_calls)
+            current_tool_calls += tool_calls_count
             
-            for tool_call in tool_calls:
+            messages.append(assistant_message)  # Add assistant's message
+            
+            for tool_call in assistant_message.tool_calls:
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
                 tool_call_id = tool_call.id
                 
                 logger.debug(f"Tool call #{current_tool_calls}: {function_name}({function_args})")
+                current_tool_calls += 1
                 
                 # Execute the tool
                 if function_name == "get_board_state":
                     tool_result = await self.execute_get_board_state(match_id)
                 elif function_name == "make_move":
                     move = function_args.get("move", "")
-                    last_move = move
                     tool_result = await self.execute_make_move(match_id, move)
                     
                     # If move was successful, return it
                     if tool_result.get("success"):
                         logger.info(f"✅ Model made valid move: {move}")
-                        return move
+                        result["move"] = move
+                        return result
                     else:
                         logger.warning(f"❌ Model made invalid move: {move} - {tool_result.get('error')}")
+                        result["invalid_move"] = True
                 else:
                     tool_result = {"error": f"Unknown function: {function_name}"}
                 
@@ -531,11 +568,13 @@ class AIModelService:
                     "tool_call_id": tool_call_id,
                     "content": json.dumps(tool_result),
                 })
-                
-        elif response.choices[0].message.content:
-            # Model responded with text (no tool calls)
-            assistant_content = response.choices[0].message.content
-            messages.append(response.choices[0].message)
+            
+            return result
+        
+        # No tool calls - model responded with text or was empty
+        if assistant_message.content:
+            assistant_content = assistant_message.content
+            messages.append(assistant_message)
             
             logger.debug(f"Model responded with text: {assistant_content[:200]}...")
             
@@ -553,148 +592,20 @@ class AIModelService:
                 validation_result = await self.execute_make_move(match_id, potential_move)
                 if validation_result.get("success"):
                     logger.info(f"✅ Model made valid move: {potential_move}")
-                    return potential_move
+                    result["move"] = potential_move
+                    return result
                 else:
                     logger.warning(f"❌ Extracted move {potential_move} was invalid: {validation_result.get('error')}")
+                    result["invalid_move"] = True
+                    return result
             
-            logger.warning(f"Model made no tool calls and no extractable move (attempt {current_tool_calls}/{max_tool_calls})")
-            
+            logger.info(f"Model made no tool calls and no extractable move - will nudge")
+        
         else:
-            logger.warning(f"Model returned empty response (attempt {current_tool_calls}/{max_tool_calls})")
-            
-        return None
-
-    async def _generate_move_with_llama_swap_tools(
-        self,
-        match_id: str,
-        messages: list,
-        current_tool_calls: int,
-        max_tool_calls: int,
-        model_id: str = None,
-    ) -> Optional[str]:
-        """Generate a move using llama-swap's text completion with custom tool parsing.
+            logger.info("Model returned empty response - will nudge")
         
-        Since llama-swap doesn't support litellm's tool calling API, we need to parse
-        tool calls from the text response manually.
-        """
-        import requests
-        import re
-        
-        # Look up the model to get its display name
-        db = await self._get_db()
-        models_col = db["models"]
-        model = await models_col.find_one({"_id": ObjectId(model_id)}) if model_id else None
-        
-        if not model:
-            # Fallback to first model
-            model = await models_col.find_one()
-        
-        if not model:
-            logger.error("No models found in database")
-            return None
-        
-        model_name = model.get("name", "Unknown")
-        display_name = model.get("model_id", "OmniCoder-9B")
-        
-        # Build a text prompt for the model
-        prompt = "You are a chess playing AI.\n\n"
-        prompt += CHESS_SYSTEM_PROMPT + "\n\n"
-        
-        # Add conversation history
-        for msg in messages:
-            if msg["role"] == "user":
-                prompt += f"User: {msg['content']}\n\n"
-            elif msg["role"] == "assistant":
-                prompt += f"Assistant: {msg['content']}\n\n"
-            elif msg["role"] == "tool":
-                prompt += f"Tool Result: {msg['content']}\n\n"
-            elif msg["role"] == "system":
-                continue  # Skip system messages in text mode
-        
-        prompt += "Assistant: "
-        
-        try:
-            # Call llama-swap
-            response = requests.post(
-                "http://localhost:8080/completion",
-                json={
-                    "model": display_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "max_tokens": 1024,
-                    "temperature": 0.7,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-            assistant_text = data.get("content", "")
-            
-            logger.debug(f"Llama-swap response from {model_name}: {assistant_text[:500]}...")
-            
-            # Parse tool calls from text
-            # Look for patterns like "get_board_state()" or "make_move('e4')"
-            get_board_match = re.search(r'get_board_state\s*\(\s*\)', assistant_text)
-            make_move_match = re.search(r'make_move\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', assistant_text)
-            
-            if get_board_match:
-                logger.debug(f"Detected get_board_state() call")
-                tool_result = await self.execute_get_board_state(match_id)
-                messages.append({
-                    "role": "assistant",
-                    "content": f"I'll call get_board_state().",
-                })
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(tool_result),
-                })
-                return None  # Continue the loop
-            
-            elif make_move_match:
-                move = make_move_match.group(1)
-                logger.debug(f"Detected make_move('{move}') call")
-                tool_result = await self.execute_make_move(match_id, move)
-                
-                messages.append({
-                    "role": "assistant",
-                    "content": f"I'll make the move {move}.",
-                })
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(tool_result),
-                })
-                
-                if tool_result.get("success"):
-                    logger.info(f"✅ Model {model_name} made valid move: {move}")
-                    return move
-                else:
-                    logger.warning(f"❌ Model {model_name} made invalid move: {move} - {tool_result.get('error')}")
-                    return None  # Continue the loop
-            
-            else:
-                # No tool calls detected, try to extract a move from the text
-                san_pattern = r'\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8][+#]?)\b'
-                matches = re.findall(san_pattern, assistant_text)
-                
-                if matches:
-                    potential_move = matches[0]
-                    logger.info(f"Extracted potential move from llama-swap response: {potential_move}")
-                    
-                    validation_result = await self.execute_make_move(match_id, potential_move)
-                    if validation_result.get("success"):
-                        logger.info(f"✅ Model {model_name} made valid move: {potential_move}")
-                        return potential_move
-                    else:
-                        logger.warning(f"❌ Extracted move {potential_move} was invalid: {validation_result.get('error')}")
-                
-                logger.warning(f"No tool calls or extractable moves found (attempt {current_tool_calls}/{max_tool_calls})")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request to llama-swap failed: {e}")
-        except Exception as e:
-            logger.error(f"Error processing llama-swap response: {e}")
-        
-        return None
+        result["nudge"] = True
+        return result
 
     # ------------------------------------------------------------------
     # DB access
