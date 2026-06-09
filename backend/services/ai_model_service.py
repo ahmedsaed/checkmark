@@ -42,23 +42,36 @@ class MoveSuggestion:
 CHESS_SYSTEM_PROMPT = """You are a chess playing AI. You play by calling tools to interact with the chess board.
 
 Available Tools:
-1. get_board_state() - Get the current board position
+1. get_board_state() - Get the current board position, turn, and all legal moves
    Input: No arguments
-   Returns: { "fen": "...", "turn": "white" or "black" }
+   Returns: { "fen": "...", "turn": "white" or "black", "legal_moves": ["e4", "Nf3", ...] }
 
 2. make_move(move: str) - Make a move in SAN notation (e.g., "e4", "Nf3", "O-O")
    Input: One string argument - the move in SAN notation
    Returns: { "success": true, "new_fen": "...", "turn": "black" }
-   OR: { "success": false, "error": "Illegal move: e5 is not legal" }
+   OR: { "success": false, "error": "Illegal move: e5 is not legal. Legal moves: [...]" }
 
 Rules:
-- Always call get_board_state() first to see the position and whose turn it is
+- Always call get_board_state() first to see the position, whose turn it is, and all legal moves
 - Call make_move() with a legal SAN notation move
 - If make_move() returns success: false, analyze the error and try a different move
 - You have a maximum of 20 tool calls per turn
 - Don't repeat the same illegal moves
 - The move MUST be in SAN notation (Standard Algebraic Notation)
 - Examples of valid moves: "e4", "Nf3", "O-O", "Bxd5+", "Qxf7#"
+
+Refer to the "Previous Moves" section to understand the game state.
+Refer to "Your Previous Outputs" to maintain your strategy and reasoning across turns.
+Adapt your plan based on the current position and opponent's moves.
+"""
+
+# Template suffix appended to CHESS_SYSTEM_PROMPT with turn history
+HISTORY_SUFFIX = """
+Previous Moves:
+{pgn_moves}
+
+Your Previous Outputs:
+{agent_outputs}
 """
 
 
@@ -324,7 +337,7 @@ class AIModelService:
             match_id: ID of the match.
 
         Returns:
-            Dict with fen and turn information.
+            Dict with fen, turn, and legal moves information.
         """
         db = await self._get_db()
         matches_col = db["matches"]
@@ -337,7 +350,16 @@ class AIModelService:
         # Parse FEN to determine turn (w=white, b=black)
         turn = "white" if fen.split()[1] == "w" else "black"
         
-        return {"fen": fen, "turn": turn}
+        # Get legal moves in SAN notation
+        try:
+            from services.chess_engine import ChessEngine
+            engine = ChessEngine()
+            board = engine.parse_fen(fen)
+            legal_moves = engine.get_all_legal_moves_san(board)
+        except Exception:
+            legal_moves = []
+        
+        return {"fen": fen, "turn": turn, "legal_moves": legal_moves}
 
     async def execute_make_move(self, match_id: str, move: str) -> Dict[str, Any]:
         """Execute the make_move tool.
@@ -409,6 +431,7 @@ class AIModelService:
         2. We execute the tools and return results to the agent
         3. The agent continues until it makes a valid move or max_tool_calls is reached
         4. Empty/non-tool responses get a nudge and don't count against the limit
+        5. Previous turn history (PGN + agent outputs) is injected into the system prompt
 
         Args:
             match_id: ID of the match.
@@ -453,11 +476,32 @@ class AIModelService:
         if api_key:
             litellm_kwargs["api_key"] = api_key
         
+        # Determine side based on total moves already played
+        matches_col = db["matches"]
+        match_doc = await matches_col.find_one({"_id": ObjectId(match_id)})
+        if not match_doc:
+            logger.error(f"Match {match_id} not found")
+            return None
+        
+        side = "white" if match_doc["total_moves"] % 2 == 0 else "black"
+        turn_number = match_doc["total_moves"] + 1
+        
+        # Load previous turns and build history prompt
+        previous_turns = await self.get_previous_turns(match_id)
+        history_prompt = self._build_history_prompt(previous_turns)
+        
+        # Build system prompt with history
+        system_content = CHESS_SYSTEM_PROMPT + "\n\n" + history_prompt
+        
         # Initialize conversation history
         messages = [
-            {"role": "system", "content": CHESS_SYSTEM_PROMPT},
-            {"role": "user", "content": "It's your turn. Please call get_board_state() to see the position."},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"It's your turn (turn {turn_number}, {side.capitalize()}). Please call get_board_state() to see the position."},
         ]
+        
+        # Track thinking text for this turn
+        turn_thinking_text = ""
+        final_move = None
         
         tool_calls_count = 0
         
@@ -467,10 +511,32 @@ class AIModelService:
                     match_id, messages, litellm_model, litellm_kwargs, tool_calls_count
                 )
                 
+                # Capture assistant's thinking text from each response
+                last_response = result.get("_last_response")
+                if last_response:
+                    thinking_content = last_response.get("content", "")
+                    if thinking_content:
+                        turn_thinking_text += thinking_content + "\n"
+                
                 if result["move"]:
+                    final_move = result["move"]
+                    # Save this turn before returning
+                    await self.save_turn(
+                        match_id=match_id,
+                        turn_number=turn_number,
+                        side=side,
+                        model_id=model_id,
+                        model_name=model_name,
+                        thinking_text=turn_thinking_text.strip(),
+                        move_san=final_move,
+                        messages=messages,
+                    )
                     return result["move"]
+                elif result["tool_calls_made"]:
+                    # Tools were called but no make_move succeeded - tool results already in context, continue loop
+                    pass
                 elif result["nudge"]:
-                    # Model didn't make a tool call - add nudge and retry (doesn't count)
+                    # Model made no tool calls - add nudge and retry (doesn't count)
                     messages.append({
                         "role": "user",
                         "content": "[INTERNAL NOTE] You must use the get_board_state() tool to see the current board position, then use make_move() to make a move. Both tools are required to play.",
@@ -479,7 +545,7 @@ class AIModelService:
                     # Model made an invalid move - loop continues (doesn't count as wasted)
                     pass
                 else:
-                    # Exception occurred
+                    # Unexpected case - add error nudge
                     messages.append({
                         "role": "user",
                         "content": "[INTERNAL NOTE] An error occurred. Please try again with get_board_state() and make_move().",
@@ -491,6 +557,21 @@ class AIModelService:
                     "role": "user",
                     "content": f"[INTERNAL NOTE] An error occurred: {str(e)}. Please try again with get_board_state() and make_move().",
                 })
+        
+        # Max tool calls reached - save the turn anyway (partial history)
+        if turn_thinking_text.strip():
+            logger.info(f"Saving partial turn {turn_number} ({side}/{model_name}) with {len(turn_thinking_text)} chars of thinking")
+        
+        await self.save_turn(
+            match_id=match_id,
+            turn_number=turn_number,
+            side=side,
+            model_id=model_id,
+            model_name=model_name,
+            thinking_text=turn_thinking_text.strip(),
+            move_san=final_move,
+            messages=messages,
+        )
         
         # Max tool calls reached
         logger.error(f"⚠️ Model {model_name} exceeded max tool calls ({max_tool_calls}) for match {match_id}")
@@ -511,8 +592,9 @@ class AIModelService:
         - nudge: True if model needs a nudge (no tool calls made)
         - invalid_move: True if model made an invalid move
         - error: True if an exception occurred
+        - _last_response: dict with the last assistant response (content for thinking text)
         """
-        result = {"move": None, "nudge": False, "invalid_move": False, "error": False}
+        result = {"move": None, "nudge": False, "invalid_move": False, "error": False, "tool_calls_made": False, "_last_response": None}
         
         # Call litellm with tools
         response = litellm.completion(
@@ -529,10 +611,23 @@ class AIModelService:
         # Increment tool calls count only when model actually uses tools
         assistant_message = response.choices[0].message
         
+        # Capture assistant content for thinking text tracking
+        assistant_content = assistant_message.content or ""
+        # Also capture reasoning_content if available (some models output chain-of-thought here)
+        reasoning = getattr(assistant_message, 'reasoning_content', None) or ""
+        if not reasoning:
+            # Try provider_specific_fields
+            psf = getattr(assistant_message, 'provider_specific_fields', {}) or {}
+            reasoning = psf.get('reasoning_content', '') or ''
+        
+        thinking_text = reasoning if reasoning else assistant_content
+        result["_last_response"] = {"content": thinking_text}
+        
         # Check for tool calls
         if assistant_message.tool_calls:
             tool_calls_count = len(assistant_message.tool_calls)
             current_tool_calls += tool_calls_count
+            result["tool_calls_made"] = True
             
             messages.append(assistant_message)  # Add assistant's message
             
@@ -573,7 +668,6 @@ class AIModelService:
         
         # No tool calls - model responded with text or was empty
         if assistant_message.content:
-            assistant_content = assistant_message.content
             messages.append(assistant_message)
             
             logger.debug(f"Model responded with text: {assistant_content[:200]}...")
@@ -606,6 +700,122 @@ class AIModelService:
         
         result["nudge"] = True
         return result
+
+    # ------------------------------------------------------------------
+    # Turn history management
+    # ------------------------------------------------------------------
+
+    async def get_previous_turns(self, match_id: str) -> List[Dict[str, Any]]:
+        """Get all previous turns for a match, ordered by turn number.
+
+        Returns:
+            List of turn documents with turn_number, side, thinking_text, move_san.
+        """
+        db = await self._get_db()
+        turns_col = db["turns"]
+
+        cursor = turns_col.find({"match_id": ObjectId(match_id)}).sort("turn_number", 1)
+        turns = []
+        async for doc in cursor:
+            turns.append({
+                "turn_number": doc["turn_number"],
+                "side": doc["side"],
+                "model_name": doc.get("model_name", "Unknown"),
+                "thinking_text": doc.get("thinking_text", ""),
+                "move_san": doc.get("move_san"),
+            })
+        return turns
+
+    async def save_turn(
+        self,
+        match_id: str,
+        turn_number: int,
+        side: str,
+        model_id: str,
+        model_name: str,
+        thinking_text: str,
+        move_san: Optional[str],
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Save a turn's conversation history to the turns collection.
+
+        Args:
+            match_id: ID of the match.
+            turn_number: Turn number (1 for White's first move, 2 for Black's first, etc.).
+            side: "white" or "black".
+            model_id: Model ID that made the move.
+            model_name: Display name of the model.
+            thinking_text: The assistant's text output (reasoning, strategy).
+            move_san: The SAN move made (or None if no valid move).
+            messages: Full conversation history for this turn.
+        """
+        db = await self._get_db()
+        turns_col = db["turns"]
+
+        # Convert messages to JSON-serializable dicts (litellm Message objects can't be encoded by MongoDB)
+        serializable_messages = []
+        for msg in messages:
+            if hasattr(msg, 'model_dump'):
+                serializable_messages.append(msg.model_dump())
+            elif hasattr(msg, '__dict__'):
+                serializable_messages.append(msg.__dict__)
+            else:
+                serializable_messages.append(msg)
+
+        turn_doc = {
+            "match_id": ObjectId(match_id),
+            "turn_number": turn_number,
+            "side": side,
+            "model_id": ObjectId(model_id),
+            "model_name": model_name,
+            "thinking_text": thinking_text,
+            "move_san": move_san,
+            "messages": serializable_messages,
+            "created_at": datetime.utcnow(),
+        }
+
+        try:
+            await turns_col.insert_one(turn_doc)
+            logger.info(f"Saved turn {turn_number} ({side}/{model_name}) to turns collection")
+        except Exception as e:
+            logger.error(f"Failed to save turn {turn_number}: {e}")
+
+    def _build_history_prompt(self, turns: List[Dict[str, Any]]) -> str:
+        """Build the PGN moves and agent outputs section for the system prompt.
+
+        Args:
+            turns: List of previous turn documents.
+
+        Returns:
+            Formatted string with PGN moves and agent outputs.
+        """
+        if not turns:
+            return "Previous Moves:\n(no previous moves - this is the first turn)\n\nYour Previous Outputs:\n(no previous outputs)\n"
+
+        # Build PGN-style move list
+        pgn_moves = ""
+        move_num = 1
+        for turn in turns:
+            san = turn.get("move_san")
+            if san:
+                if turn["side"] == "white":
+                    pgn_moves += f"{move_num}. {san} "
+                else:
+                    pgn_moves += f"{san}\n"
+                    move_num += 1
+
+        # Build agent outputs section
+        agent_outputs = ""
+        for turn in turns:
+            thinking = turn.get("thinking_text", "")
+            if thinking:
+                agent_outputs += f"Turn {turn['turn_number']} ({turn['side'].capitalize()}):\n"
+                agent_outputs += f"  {thinking[:500]}\n\n"  # Truncate to 500 chars to keep prompt manageable
+
+        return HISTORY_SUFFIX.format(
+            pgn_moves=pgn_moves if pgn_moves.strip() else "(no previous moves - this is the first turn)",
+            agent_outputs=agent_outputs if agent_outputs.strip() else "(no previous outputs)",
+        )
 
     # ------------------------------------------------------------------
     # DB access

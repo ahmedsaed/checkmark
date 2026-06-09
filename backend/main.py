@@ -229,7 +229,7 @@ async def stream_match(
     match_id: str,
     service: MatchService = Depends(get_match_service),
 ):
-    """SSE stream of a match. Streams all moves if finished, or keeps streaming as moves come in."""
+    """SSE stream of a match. Streams thinking, moves, and match_end events."""
     match = await service.get_match(match_id)
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -238,6 +238,7 @@ async def stream_match(
         try:
             from bson import ObjectId
             db = await service._get_db()
+            turns_col = db["turns"]
             moves_col = db["moves"]
 
             def move_to_dict(doc):
@@ -256,16 +257,41 @@ async def stream_match(
                     "timestamp": doc["timestamp"].isoformat() if doc.get("timestamp") else None,
                 }
 
-            # Fetch moves already in DB
-            cursor = moves_col.find({"match_id": ObjectId(match["id"])}).sort("move_number", 1)
+            # Fetch existing turns and moves
+            cursor_turns = turns_col.find({"match_id": ObjectId(match["id"])}).sort("turn_number", 1)
+            existing_turns = []
+            async for doc in cursor_turns:
+                existing_turns.append({
+                    "turn_number": doc["turn_number"],
+                    "side": doc["side"],
+                    "model_name": doc.get("model_name", "Unknown"),
+                    "thinking_text": doc.get("thinking_text", ""),
+                    "move_san": doc.get("move_san"),
+                })
+
+            # Fetch existing moves
+            cursor_moves = moves_col.find({"match_id": ObjectId(match["id"])}).sort("move_number", 1)
             existing_moves = []
-            async for doc in cursor:
+            async for doc in cursor_moves:
                 existing_moves.append(move_to_dict(doc))
 
-            # Track last move number we've sent
+            # Track last move number and last turn number we've sent
             last_move_number = existing_moves[-1]["move_number"] if existing_moves else 0
+            last_turn_number = existing_turns[-1]["turn_number"] if existing_turns else 0
 
-            # Send existing moves immediately
+            # Send thinking events for existing turns
+            for turn in existing_turns:
+                if turn["thinking_text"].strip():
+                    thinking_event = {
+                        "type": "thinking",
+                        "turn_number": turn["turn_number"],
+                        "side": turn["side"],
+                        "model_name": turn["model_name"],
+                        "text": turn["thinking_text"],
+                    }
+                    yield f"data: {json.dumps(thinking_event)}\n\n"
+
+            # Send move events for existing moves
             for move in existing_moves:
                 yield f"data: {json.dumps(move)}\n\n"
 
@@ -274,7 +300,7 @@ async def stream_match(
                 yield f"data: {json.dumps({'type': 'match_end', 'status': match.get('status'), 'winner': match.get('winner_id')})}\n\n"
                 return
 
-            # Poll for new moves while match is ongoing
+            # Poll for new turns and moves while match is ongoing
             while True:
                 await asyncio.sleep(1)
 
@@ -284,13 +310,41 @@ async def stream_match(
                     yield f"data: {json.dumps({'type': 'match_removed'})}\n\n"
                     break
 
+                # Fetch new turns
+                cursor_turns = turns_col.find({
+                    "match_id": ObjectId(current_match["id"]),
+                    "turn_number": {"$gt": last_turn_number},
+                }).sort("turn_number", 1)
+                new_turns = []
+                async for doc in cursor_turns:
+                    new_turns.append({
+                        "turn_number": doc["turn_number"],
+                        "side": doc["side"],
+                        "model_name": doc.get("model_name", "Unknown"),
+                        "thinking_text": doc.get("thinking_text", ""),
+                        "move_san": doc.get("move_san"),
+                    })
+
+                # Stream thinking events for new turns
+                for turn in new_turns:
+                    if turn["thinking_text"].strip():
+                        thinking_event = {
+                            "type": "thinking",
+                            "turn_number": turn["turn_number"],
+                            "side": turn["side"],
+                            "model_name": turn["model_name"],
+                            "text": turn["thinking_text"],
+                        }
+                        yield f"data: {json.dumps(thinking_event)}\n\n"
+                    last_turn_number = max(last_turn_number, turn["turn_number"])
+
                 # Fetch new moves
-                cursor = moves_col.find({
+                cursor_moves = moves_col.find({
                     "match_id": ObjectId(current_match["id"]),
                     "move_number": {"$gt": last_move_number},
                 }).sort("move_number", 1)
                 new_moves = []
-                async for doc in cursor:
+                async for doc in cursor_moves:
                     new_moves.append(move_to_dict(doc))
 
                 # Stream new moves
@@ -298,8 +352,8 @@ async def stream_match(
                     yield f"data: {json.dumps(move)}\n\n"
                     last_move_number = max(last_move_number, move["move_number"])
 
-                if new_moves:
-                    logger.info(f"Match {match_id}: streamed {len(new_moves)} move(s)")
+                if new_turns or new_moves:
+                    logger.info(f"Match {match_id}: streamed {len(new_turns)} thinking event(s) and {len(new_moves)} move(s)")
 
                 # Check if match finished
                 if current_match.get("status") != "active":
